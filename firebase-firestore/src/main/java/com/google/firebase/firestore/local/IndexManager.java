@@ -15,6 +15,7 @@
 package com.google.firebase.firestore.local;
 
 import com.google.firebase.firestore.core.Target;
+import com.google.firebase.firestore.model.Document;
 import com.google.firebase.firestore.model.DocumentKey;
 import com.google.firebase.firestore.model.FieldIndex;
 import com.google.firebase.firestore.model.ResourcePath;
@@ -43,6 +44,8 @@ public interface IndexManager {
    */
   List<ResourcePath> getCollectionParents(String collectionId);
 
+  void addIndexEntries(Document document);
+
   /**
    * Adds a field path index.
    *
@@ -51,5 +54,5 @@ public interface IndexManager {
    */
   void addFieldIndex(FieldIndex index);
 
-  Iterable<DocumentKey> getDocumentsMatchingTarget(Target target);
+  List<DocumentKey> getDocumentsMatchingTarget(Target target);
 }

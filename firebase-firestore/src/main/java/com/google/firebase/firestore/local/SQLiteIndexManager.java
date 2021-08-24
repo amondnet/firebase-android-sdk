@@ -22,6 +22,7 @@ import com.google.firebase.firestore.core.Bound;
 import com.google.firebase.firestore.core.Target;
 import com.google.firebase.firestore.index.FirestoreIndexValueWriter;
 import com.google.firebase.firestore.index.IndexByteEncoder;
+import com.google.firebase.firestore.model.Document;
 import com.google.firebase.firestore.model.DocumentKey;
 import com.google.firebase.firestore.model.FieldIndex;
 import com.google.firebase.firestore.model.ResourcePath;
@@ -100,8 +101,55 @@ final class SQLiteIndexManager implements IndexManager {
   }
 
   @Override
+  public void addIndexEntries(Document document) {
+    String collectionGroup = document.getKey().getPath().popLast().canonicalString();
+    db.query("SELECT index_id, index_proto FROM index_configuration WHERE collection_group = ?")
+        .binding(collectionGroup)
+        .forEach(
+            row -> {
+              try {
+                int indexId = row.getInt(0);
+                FieldIndex fieldIndex =
+                    serializer.decodeFieldIndex(
+                        collectionGroup, row.getInt(0), Index.parseFrom(row.getBlob(1)));
+
+                List<Value> values = extractFieldValue(document, fieldIndex);
+                if (values == null) return;
+
+                List<byte[]> encodeValues = encodeValues(fieldIndex, values);
+                for (byte[] encoded : encodeValues) {
+                  // TODO(indexing): Handle different values for different users
+                  db.execute(
+                      "INSERT OR IGNORE INTO index_entries ("
+                          + "index_id, "
+                          + "index_value, "
+                          + "document_id ) VALUES(?, ?, ?)",
+                      indexId,
+                      encoded,
+                      document.getKey().getPath().getLastSegment());
+                }
+              } catch (InvalidProtocolBufferException e) {
+                throw fail("Invalid index: " + e);
+              }
+            });
+  }
+
   @Nullable
-  public Iterable<DocumentKey> getDocumentsMatchingTarget(Target target) {
+  private List<Value> extractFieldValue(Document document, FieldIndex fieldIndex) {
+    List<Value> values = new ArrayList<>();
+    for (FieldIndex.Segment segment : fieldIndex) {
+      Value field = document.getField(segment.getFieldPath());
+      if (field == null) {
+        return null;
+      }
+      values.add(field);
+    }
+    return values;
+  }
+
+  @Override
+  @Nullable
+  public List<DocumentKey> getDocumentsMatchingTarget(Target target) {
     ResourcePath parentPath = target.getPath().popLast();
     @Nullable FieldIndex fieldIndex = getMatchingIndex(target);
 
@@ -114,29 +162,27 @@ final class SQLiteIndexManager implements IndexManager {
     ArrayList<DocumentKey> documents = new ArrayList<>();
 
     if (upperBound != null) {
-      List<byte[]> lowerBoundValues = encodeValues(fieldIndex, lowerBound.getPosition(), false);
-      List<byte[]> upperBoundValues = encodeValues(fieldIndex, upperBound.getPosition(), false);
+      List<byte[]> lowerBoundValues = encodeValues(fieldIndex, lowerBound.getPosition());
+      List<byte[]> upperBoundValues = encodeValues(fieldIndex, upperBound.getPosition());
 
       for (byte[] lowerBoundValue : lowerBoundValues) {
         for (byte[] upperBoundValue : upperBoundValues) {
           db.query(
-                  "SELECT document_id from field_index WHERE index_id = ? AND index_value "
-                      + (lowerBound.isBefore() ? ">=" : ">")
-                      + " ? AND index_value "
-                      + (upperBound.isBefore() ? "<=" : "<")
-                      + " ?")
+                  String.format(
+                      "SELECT document_id from field_index WHERE index_id = ? AND index_value %s ? AND index_value %s ?",
+                      lowerBound.isBefore() ? ">=" : ">", upperBound.isBefore() ? "<=" : "<"))
               .binding(fieldIndex, lowerBoundValue, upperBoundValue)
               .forEach(
                   row -> documents.add(DocumentKey.fromPath(parentPath.append(row.getString(0)))));
         }
       }
     } else {
-      List<byte[]> lowerBoundValues = encodeValues(fieldIndex, lowerBound.getPosition(), false);
+      List<byte[]> lowerBoundValues = encodeValues(fieldIndex, lowerBound.getPosition());
       for (byte[] lowerBoundValue : lowerBoundValues) {
         db.query(
-                "SELECT document_id from field_index WHERE index_id = ? AND index_value "
-                    + (lowerBound.isBefore() ? ">=" : ">")
-                    + "  ?")
+                String.format(
+                    "SELECT document_id from field_index WHERE index_id = ? AND index_value %s  ?",
+                    lowerBound.isBefore() ? ">=" : ">"))
             .binding(fieldIndex, lowerBoundValue)
             .forEach(
                 row -> documents.add(DocumentKey.fromPath(parentPath.append(row.getString(0)))));
@@ -183,47 +229,42 @@ final class SQLiteIndexManager implements IndexManager {
     return activeIndices.get(0);
   }
 
-  private List<byte[]> encodeValues(FieldIndex index, List<Value> values, boolean enforceArrays) {
+  private List<byte[]> encodeValues(FieldIndex fieldIndex, List<Value> values) {
     List<IndexByteEncoder> encoders = new ArrayList<>();
     encoders.add(new IndexByteEncoder());
-    encodeValues(index, values, enforceArrays, encoders);
+
+    for (int i = 0; i < fieldIndex.segmentCount(); ++i) {
+      for (IndexByteEncoder encoder : encoders) {
+        FieldIndex.Segment segment = fieldIndex.getSegment(i);
+        Value value = values.get(i);
+
+        if (segment.getKind() == FieldIndex.Segment.Kind.ORDERED) {
+          FirestoreIndexValueWriter.INSTANCE.writeIndexValue(value, encoder);
+        } else {
+          hardAssert(
+              segment.getKind() == FieldIndex.Segment.Kind.CONTAINS,
+              "Only ORDERED and CONTAINS are supported");
+
+          List<IndexByteEncoder> prefixes = encoders;
+          encoders = new ArrayList<>();
+
+          for (Value arrayElement : value.getArrayValue().getValuesList()) {
+            for (IndexByteEncoder prefix : prefixes) {
+              IndexByteEncoder clonedEncoder = new IndexByteEncoder();
+              clonedEncoder.seed(prefix.getEncodedBytes());
+              FirestoreIndexValueWriter.INSTANCE.writeIndexValue(arrayElement, clonedEncoder);
+              encoders.add(clonedEncoder);
+            }
+          }
+        }
+      }
+    }
+
     List<byte[]> result = new ArrayList<>();
     for (IndexByteEncoder encoder : encoders) {
       result.add(encoder.getEncodedBytes());
     }
     return result;
-  }
-
-  private void encodeValues(
-      FieldIndex index,
-      List<Value> values,
-      boolean enforceArrays,
-      List<IndexByteEncoder> encoders) {
-    if (values.isEmpty()) return;
-    for (FieldIndex.Segment indexSegment : index) {
-      for (IndexByteEncoder indexByteEncoder : new ArrayList<>(encoders)) {
-        switch (indexSegment.getKind()) {
-          case ORDERED:
-            FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
-                values.get(0), new IndexByteEncoder());
-            break;
-          case CONTAINS:
-            if (values.get(0).hasArrayValue()) {
-              encoders.clear();
-              for (Value value : values.get(0).getArrayValue().getValuesList()) {
-                IndexByteEncoder clonedEncoder = new IndexByteEncoder();
-                clonedEncoder.seed(indexByteEncoder.getEncodedBytes());
-                encoders.add(clonedEncoder);
-                FirestoreIndexValueWriter.INSTANCE.writeIndexValue(value, new IndexByteEncoder());
-              }
-            } else if (!enforceArrays) {
-              FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
-                  values.get(0), new IndexByteEncoder());
-            }
-            break;
-        }
-      }
-    }
   }
 
   private byte[] encodeFieldIndex(FieldIndex fieldIndex) {
