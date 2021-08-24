@@ -14,6 +14,8 @@
 
 package com.google.firebase.firestore.local;
 
+import com.google.firebase.firestore.core.Target;
+import com.google.firebase.firestore.model.DocumentKey;
 import com.google.firebase.firestore.model.FieldIndex;
 import com.google.firebase.firestore.model.ResourcePath;
 import java.util.List;
@@ -48,4 +50,6 @@ public interface IndexManager {
    * execution once values are persisted.
    */
   void addFieldIndex(FieldIndex index);
+
+  Iterable<DocumentKey> getDocumentsMatchingTarget(Target target);
 }

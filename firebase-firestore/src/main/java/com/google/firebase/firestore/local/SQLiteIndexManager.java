@@ -14,11 +14,23 @@
 
 package com.google.firebase.firestore.local;
 
+import static com.google.firebase.firestore.util.Assert.fail;
 import static com.google.firebase.firestore.util.Assert.hardAssert;
 
+import androidx.annotation.Nullable;
+import com.google.firebase.firestore.core.Bound;
+import com.google.firebase.firestore.core.Target;
+import com.google.firebase.firestore.index.FirestoreIndexValueWriter;
+import com.google.firebase.firestore.index.IndexByteEncoder;
+import com.google.firebase.firestore.model.DocumentKey;
 import com.google.firebase.firestore.model.FieldIndex;
 import com.google.firebase.firestore.model.ResourcePath;
+import com.google.firebase.firestore.model.TargetIndexMatcher;
+import com.google.firestore.admin.v1.Index;
+import com.google.firestore.v1.Value;
+import com.google.protobuf.InvalidProtocolBufferException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /** A persisted implementation of IndexManager. */
@@ -85,6 +97,133 @@ final class SQLiteIndexManager implements IndexManager {
         index.getCollectionId(),
         encodeFieldIndex(index),
         true);
+  }
+
+  @Override
+  @Nullable
+  public Iterable<DocumentKey> getDocumentsMatchingTarget(Target target) {
+    ResourcePath parentPath = target.getPath().popLast();
+    @Nullable FieldIndex fieldIndex = getMatchingIndex(target);
+
+    if (fieldIndex == null) return null;
+
+    Bound lowerBound = target.getLowerBound(fieldIndex);
+    @Nullable Bound upperBound = target.getUpperBound(fieldIndex);
+
+    // Could we do a join here and return the documents?
+    ArrayList<DocumentKey> documents = new ArrayList<>();
+
+    if (upperBound != null) {
+      List<byte[]> lowerBoundValues = encodeValues(fieldIndex, lowerBound.getPosition(), false);
+      List<byte[]> upperBoundValues = encodeValues(fieldIndex, upperBound.getPosition(), false);
+
+      for (byte[] lowerBoundValue : lowerBoundValues) {
+        for (byte[] upperBoundValue : upperBoundValues) {
+          db.query(
+                  "SELECT document_id from field_index WHERE index_id = ? AND index_value "
+                      + (lowerBound.isBefore() ? ">=" : ">")
+                      + " ? AND index_value "
+                      + (upperBound.isBefore() ? "<=" : "<")
+                      + " ?")
+              .binding(fieldIndex, lowerBoundValue, upperBoundValue)
+              .forEach(
+                  row -> documents.add(DocumentKey.fromPath(parentPath.append(row.getString(0)))));
+        }
+      }
+    } else {
+      List<byte[]> lowerBoundValues = encodeValues(fieldIndex, lowerBound.getPosition(), false);
+      for (byte[] lowerBoundValue : lowerBoundValues) {
+        db.query(
+                "SELECT document_id from field_index WHERE index_id = ? AND index_value "
+                    + (lowerBound.isBefore() ? ">=" : ">")
+                    + "  ?")
+            .binding(fieldIndex, lowerBoundValue)
+            .forEach(
+                row -> documents.add(DocumentKey.fromPath(parentPath.append(row.getString(0)))));
+      }
+    }
+    return documents;
+  }
+
+  private @Nullable FieldIndex getMatchingIndex(Target target) {
+    TargetIndexMatcher targetIndexMatcher = new TargetIndexMatcher(target);
+    String collectionGroup =
+        target.getCollectionGroup() != null
+            ? target.getCollectionGroup()
+            : target.getPath().getLastSegment();
+
+    List<FieldIndex> activeIndices = new ArrayList<>();
+
+    db.query(
+            "SELECT index_id, index_proto FROM index_configuration WHERE collection_group = ? AND active = 1")
+        .binding(collectionGroup)
+        .forEach(
+            row -> {
+              try {
+                FieldIndex fieldIndex =
+                    serializer.decodeFieldIndex(
+                        collectionGroup, row.getInt(0), Index.parseFrom(row.getBlob(1)));
+                boolean matches = targetIndexMatcher.servedByIndex(fieldIndex);
+                if (matches) {
+                  activeIndices.add(fieldIndex);
+                }
+              } catch (InvalidProtocolBufferException e) {
+                throw fail("Failed to decode index: " + e);
+              }
+            });
+    ;
+
+    if (activeIndices.isEmpty()) {
+      return null;
+    }
+
+    // Return the index with the most number of segments
+    Collections.sort(
+        activeIndices, (i1, i2) -> Integer.compare(i2.segmentCount(), i1.segmentCount()));
+    return activeIndices.get(0);
+  }
+
+  private List<byte[]> encodeValues(FieldIndex index, List<Value> values, boolean enforceArrays) {
+    List<IndexByteEncoder> encoders = new ArrayList<>();
+    encoders.add(new IndexByteEncoder());
+    encodeValues(index, values, enforceArrays, encoders);
+    List<byte[]> result = new ArrayList<>();
+    for (IndexByteEncoder encoder : encoders) {
+      result.add(encoder.getEncodedBytes());
+    }
+    return result;
+  }
+
+  private void encodeValues(
+      FieldIndex index,
+      List<Value> values,
+      boolean enforceArrays,
+      List<IndexByteEncoder> encoders) {
+    if (values.isEmpty()) return;
+    for (FieldIndex.Segment indexSegment : index) {
+      for (IndexByteEncoder indexByteEncoder : new ArrayList<>(encoders)) {
+        switch (indexSegment.getKind()) {
+          case ORDERED:
+            FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
+                values.get(0), new IndexByteEncoder());
+            break;
+          case CONTAINS:
+            if (values.get(0).hasArrayValue()) {
+              encoders.clear();
+              for (Value value : values.get(0).getArrayValue().getValuesList()) {
+                IndexByteEncoder clonedEncoder = new IndexByteEncoder();
+                clonedEncoder.seed(indexByteEncoder.getEncodedBytes());
+                encoders.add(clonedEncoder);
+                FirestoreIndexValueWriter.INSTANCE.writeIndexValue(value, new IndexByteEncoder());
+              }
+            } else if (!enforceArrays) {
+              FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
+                  values.get(0), new IndexByteEncoder());
+            }
+            break;
+        }
+      }
+    }
   }
 
   private byte[] encodeFieldIndex(FieldIndex fieldIndex) {
